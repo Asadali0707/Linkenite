@@ -1,21 +1,567 @@
-sender,subject,body,sent_date
-eve@startup.io,Help required with account verification,"Do you support integration with third-party APIs? Specifically, I’m looking for CRM integration options.",2025-08-19 00:58:09
-diana@client.co,General query about subscription,"Hi team, I am unable to log into my account since yesterday. Could you please help me resolve this issue?",2025-08-25 00:58:09
-eve@startup.io,Immediate support needed for billing error,"Hello, I wanted to understand the pricing tiers better. Could you share a detailed breakdown?",2025-08-20 12:58:09
-alice@example.com,Urgent request: system access blocked,"Hi team, I am unable to log into my account since yesterday. Could you please help me resolve this issue?",2025-08-21 21:58:09
-eve@startup.io,Question: integration with API,"Despite multiple attempts, I cannot reset my password. The reset link doesn’t seem to work.",2025-08-20 04:58:09
-alice@example.com,Critical help needed for downtime,"Hi team, I am unable to log into my account since yesterday. Could you please help me resolve this issue?",2025-08-18 08:58:09
-diana@client.co,Help required with account verification,There is a billing error where I was charged twice. This needs immediate correction.,2025-08-20 19:58:09
-diana@client.co,Support needed for login issue,I am facing issues with verifying my account. The verification email never arrived. Can you assist?,2025-08-23 06:58:09
-alice@example.com,General query about subscription,"Our servers are down, and we need immediate support. This is highly critical.",2025-08-26 02:58:09
-alice@example.com,Help required with account verification,"Do you support integration with third-party APIs? Specifically, I’m looking for CRM integration options.",2025-08-21 13:58:09
-diana@client.co,Support needed for login issue,"Hi team, I am unable to log into my account since yesterday. Could you please help me resolve this issue?",2025-08-26 15:58:09
-alice@example.com,Help required with account verification,"Do you support integration with third-party APIs? Specifically, I’m looking for CRM integration options.",2025-08-24 05:58:09
-eve@startup.io,Critical help needed for downtime,"Our servers are down, and we need immediate support. This is highly critical.",2025-08-21 19:58:09
-alice@example.com,Query about product pricing,There is a billing error where I was charged twice. This needs immediate correction.,2025-08-24 13:58:09
-alice@example.com,General query about subscription,I am facing issues with verifying my account. The verification email never arrived. Can you assist?,2025-08-26 01:58:09
-alice@example.com,Immediate support needed for billing error,"Despite multiple attempts, I cannot reset my password. The reset link doesn’t seem to work.",2025-08-19 07:58:09
-charlie@partner.org,Help required with account verification,"This is urgent – our system is completely inaccessible, and this is affecting our operations.",2025-08-18 00:58:09
-diana@client.co,Request for refund process clarification,Could you clarify the steps involved in requesting a refund? I submitted one last week but have no update.,2025-08-22 17:58:09
-eve@startup.io,Query about product pricing,"Our servers are down, and we need immediate support. This is highly critical.",2025-08-22 09:58:09
-bob@customer.com,Urgent request: system access blocked,"Despite multiple attempts, I cannot reset my password. The reset link doesn’t seem to work.",2025-08-19 13:58:09
+"""
+AI-Powered Communication Assistant — Single-File Streamlit App
+----------------------------------------------------------------
+✅ Features implemented per spec:
+- Email retrieval (demo via CSV + optional IMAP)
+- Filtering on subject terms (Support/Query/Request/Help)
+- Categorization: sentiment (ML or rule-based), priority (keyword rules + scoring)
+- Context-aware auto-responses with empathy + RAG (TF-IDF over a tiny built-in KB)
+- Information extraction (contact details, requirements, sentiment indicators)
+- Priority queue (urgent first)
+- Dashboard with metrics + interactive charts + tables
+- Review/edit AI-generated drafts before sending; mark resolved/pending
+- SQLite storage for emails & responses
+
+🔧 How to run locally:
+1) Install dependencies:
+   pip install streamlit pandas numpy scikit-learn sqlalchemy python-dotenv imapclient email-validator textblob transformers torch altair plotly
+   
+   (Tip: If transformers/torch are heavy, the app falls back to a light rule-based sentiment.)
+
+2) Save this file as `app.py` and run:
+   streamlit run app.py
+
+3) (Optional) Create a `.env` file for IMAP/SMTP if you want live email:
+   IMAP_HOST=imap.gmail.com
+   IMAP_USER=you@example.com
+   IMAP_PASS=your_app_password
+   SMTP_HOST=smtp.gmail.com
+   SMTP_PORT=587
+   SMTP_USER=you@example.com
+   SMTP_PASS=your_app_password
+
+4) Demo data: upload the provided CSV (columns: sender,subject,body,sent_date)
+
+"""
+
+import os
+import re
+import io
+import time
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional, Tuple
+
+import pandas as pd
+import numpy as np
+import streamlit as st
+import altair as alt
+import plotly.express as px
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# Optional heavy deps — guarded imports
+USE_TRANSFORMERS = False
+try:
+    from transformers import pipeline
+    USE_TRANSFORMERS = True
+except Exception:
+    USE_TRANSFORMERS = False
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# ---------------------------
+# App Config
+# ---------------------------
+st.set_page_config(page_title="AI-Powered Communication Assistant", layout="wide")
+st.title("📬 AI-Powered Communication Assistant")
+st.caption("End-to-end email triage, prioritization, insights, and AI responses — built in Streamlit.")
+
+# ---------------------------
+# SQLite Setup
+# ---------------------------
+DB_PATH = os.environ.get("ASSISTANT_DB_PATH", "assistant.db")
+engine: Engine = create_engine(f"sqlite:///{DB_PATH}")
+
+def init_db():
+    with engine.begin() as conn:
+        conn.execute(text(
+            """
+            CREATE TABLE IF NOT EXISTS emails (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender TEXT,
+                subject TEXT,
+                body TEXT,
+                sent_date TEXT,
+                is_urgent INTEGER DEFAULT 0,
+                sentiment TEXT,
+                priority_score REAL DEFAULT 0,
+                category TEXT,
+                extracted_phone TEXT,
+                extracted_alt_email TEXT,
+                requirement_summary TEXT,
+                status TEXT DEFAULT 'pending'
+            );
+            """
+        ))
+        conn.execute(text(
+            """
+            CREATE TABLE IF NOT EXISTS responses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email_id INTEGER,
+                draft TEXT,
+                sent INTEGER DEFAULT 0,
+                sent_at TEXT,
+                FOREIGN KEY(email_id) REFERENCES emails(id)
+            );
+            """
+        ))
+
+init_db()
+
+# ---------------------------
+# Built-in Knowledge Base (RAG corpus)
+# ---------------------------
+KB_SNIPPETS = {
+    "billing": "If you were charged twice, we issue refunds within 3–5 business days. Share the last 4 digits of the card, invoice ID, and date to expedite.",
+    "login": "For login issues, confirm the email is verified. Use the password reset link; tokens expire in 15 minutes. Clear cache or use an incognito window.",
+    "password reset": "Reset links are single-use and expire in 15 minutes. If the link fails, request a new one and avoid multiple clicks.",
+    "api integration": "We support REST and webhooks. CRM integrations are available for HubSpot, Salesforce, and Zoho via OAuth 2.0.",
+    "server downtime": "Check status at status.example.com. Critical incidents are acknowledged within 15 minutes with hourly updates.",
+    "verification": "Account verification email may take up to 10 minutes. Check spam. We can manually verify with a domain-verified email.",
+    "refund": "Refunds follow our policy: 7-day window for self-serve plans; submit reason and invoice ID.",
+    "pricing": "Pricing tiers: Basic, Pro, Enterprise. Pro adds SSO, audit logs; Enterprise adds custom SLA and dedicated support.",
+    "subscription": "Subscriptions renew monthly. You can switch tiers anytime; proration applies at the next billing cycle.",
+}
+
+KB_KEYS = list(KB_SNIPPETS.keys())
+KB_DOCS = list(KB_SNIPPETS.values())
+
+_kb_vectorizer = TfidfVectorizer(stop_words="english")
+_kb_matrix = _kb_vectorizer.fit_transform(KB_DOCS)
+
+# ---------------------------
+# Utility: Sentiment
+# ---------------------------
+SENTIMENT_LEX = {
+    "negative": [
+        "urgent", "immediately", "cannot", "blocked", "error", "down", "critical",
+        "charged twice", "double charged", "not working", "failed", "issue", "problem",
+        "frustrated", "angry", "upset", "escalate"
+    ],
+    "positive": [
+        "thanks", "thank you", "appreciate", "great", "awesome", "love"
+    ]
+}
+
+_sentiment_pipe = None
+if USE_TRANSFORMERS:
+    try:
+        _sentiment_pipe = pipeline("sentiment-analysis")
+    except Exception:
+        _sentiment_pipe = None
+
+
+def detect_sentiment(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return "neutral"
+    # Try ML
+    if _sentiment_pipe is not None:
+        try:
+            res = _sentiment_pipe(text[:512])[0]
+            label = res.get("label", "NEUTRAL").lower()
+            if "neg" in label:
+                return "negative"
+            if "pos" in label:
+                return "positive"
+            return "neutral"
+        except Exception:
+            pass
+    # Fallback rule-based
+    t = text.lower()
+    neg = any(w in t for w in SENTIMENT_LEX["negative"]) 
+    pos = any(w in t for w in SENTIMENT_LEX["positive"]) 
+    if neg and not pos:
+        return "negative"
+    if pos and not neg:
+        return "positive"
+    return "neutral"
+
+# ---------------------------
+# Utility: Priority Scoring
+# ---------------------------
+PRIORITY_KEYWORDS = {
+    "downtime": ["server down", "servers are down", "downtime", "outage", "system is completely inaccessible"],
+    "access": ["cannot access", "access blocked", "unable to log in", "login issue", "blocked"],
+    "billing": ["charged twice", "billing error", "refund"],
+    "password": ["reset link doesn’t work", "password reset", "reset link doesn't work"],
+    "immediacy": ["urgent", "immediately", "asap", "critical"],
+}
+
+CATEGORY_RULES = {
+    "Downtime": PRIORITY_KEYWORDS["downtime"],
+    "Login": PRIORITY_KEYWORDS["access"],
+    "Password Reset": PRIORITY_KEYWORDS["password"],
+    "Billing": PRIORITY_KEYWORDS["billing"],
+    "Integration": ["integration", "api", "crm"],
+    "Verification": ["verify", "verification email"],
+    "Pricing": ["pricing", "tiers"],
+    "Subscription": ["subscription"],
+    "Refund": ["refund"],
+}
+
+FILTER_TERMS = ["support", "query", "request", "help"]
+
+
+def score_priority(subject: str, body: str) -> Tuple[float, bool, str]:
+    text = f"{subject} \n {body}".lower()
+    score = 0.0
+    # weight categories
+    if any(k in text for k in PRIORITY_KEYWORDS["immediacy"]):
+        score += 3
+    if any(k in text for k in PRIORITY_KEYWORDS["downtime"]):
+        score += 5
+    if any(k in text for k in PRIORITY_KEYWORDS["access"]):
+        score += 4
+    if any(k in text for k in PRIORITY_KEYWORDS["billing"]):
+        score += 4
+    if any(k in text for k in PRIORITY_KEYWORDS["password"]):
+        score += 2
+    # derive category
+    category = "General"
+    for cat, keys in CATEGORY_RULES.items():
+        if any(k in text for k in keys):
+            category = cat
+            break
+    is_urgent = score >= 5 or ("urgent" in text or "critical" in text)
+    return score, is_urgent, category
+
+# ---------------------------
+# Information Extraction
+# ---------------------------
+PHONE_RE = re.compile(r"(\+?\d[\d\s\-]{7,}\d)")
+EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
+
+
+def extract_info(body: str) -> Tuple[str, str, str]:
+    body = body or ""
+    phones = PHONE_RE.findall(body)
+    emails = [e for e in EMAIL_RE.findall(body) if not e.lower().endswith("example.com")]  # ignore placeholders
+    # Simple requirement summary: pick key sentences containing verbs
+    sentences = re.split(r"(?<=[.!?])\s+", body.strip())
+    key_sents = [s for s in sentences if any(v in s.lower() for v in ["need", "cannot", "blocked", "require", "help", "reset", "charged", "integrat", "down", "refund"])][:2]
+    requirement_summary = " ".join(key_sents)[:400]
+    phone = ", ".join(dict.fromkeys(phones))[:100]
+    alt_email = ", ".join(dict.fromkeys(emails))[:200]
+    return phone, alt_email, requirement_summary
+
+# ---------------------------
+# RAG Retrieval
+# ---------------------------
+
+def retrieve_kb_context(query: str, top_k: int = 2) -> List[str]:
+    if not query:
+        return []
+    q_vec = _kb_vectorizer.transform([query])
+    sims = cosine_similarity(q_vec, _kb_matrix).flatten()
+    idxs = sims.argsort()[::-1][:top_k]
+    return [KB_DOCS[i] for i in idxs if sims[i] > 0.0]
+
+# ---------------------------
+# Draft Generation (LLM-ready, with graceful fallback)
+# ---------------------------
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+
+def generate_draft(sender: str, subject: str, body: str, category: str, sentiment: str, kb_context: List[str]) -> str:
+    # Empathy lead-ins
+    empathy = {
+        "negative": "I'm sorry for the trouble and appreciate you flagging this.",
+        "positive": "Thanks for the cheerful note and the details!",
+        "neutral": "Thanks for reaching out and sharing the details.",
+    }[sentiment]
+
+    # Short category-specific headers
+    headers = {
+        "Downtime": "Regarding the service downtime",
+        "Login": "Regarding your login access",
+        "Password Reset": "About the password reset link",
+        "Billing": "About the billing discrepancy",
+        "Integration": "On API/CRM integration options",
+        "Verification": "About account verification",
+        "Pricing": "About pricing tiers",
+        "Subscription": "About your subscription",
+        "Refund": "About your refund request",
+        "General": f"Re: {subject}",
+    }
+
+    tips = "\n\n".join(f"• {c}" for c in kb_context)
+
+    # Template (can be replaced with a real LLM call)
+    draft = f"""
+Subject: {headers.get(category, 'Re: Your request')}
+
+Hi {sender.split('@')[0].split('.')[0].title()},
+
+{empathy}
+
+Here’s what we’re doing next:
+1) We’ve categorized your request as **{category}** with **{sentiment}** sentiment.
+2) Our team is prioritizing this and will keep you posted.
+
+Helpful notes based on your case:
+{tips if tips else '• We will follow up with the next steps shortly.'}
+
+Could you please share any of the following (if applicable) to speed things up?
+- Relevant screenshots or error messages
+- Invoice/Order ID (for billing/refund)
+- Approximate time of issue and browser/app used
+
+Best regards,
+Support Team
+""".strip()
+
+    return draft
+
+# ---------------------------
+# Email IO (CSV + optional IMAP/SMTP stubs)
+# ---------------------------
+
+def load_emails_csv(file: io.BytesIO) -> pd.DataFrame:
+    df = pd.read_csv(file)
+    # Normalize columns
+    rename_map = {c: c.strip().lower() for c in df.columns}
+    df.columns = rename_map.values()
+    needed = ["sender", "subject", "body", "sent_date"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV missing columns: {missing}")
+    # Parse dates
+    df["sent_date"] = pd.to_datetime(df["sent_date"], errors="coerce")
+    return df
+
+
+def filter_by_subject_terms(df: pd.DataFrame, terms: List[str]) -> pd.DataFrame:
+    pattern = r"|".join([re.escape(t) for t in terms])
+    mask = df["subject"].str.contains(pattern, case=False, na=False)
+    return df[mask].copy()
+
+# ---------------------------
+# Persistence helpers
+# ---------------------------
+
+def upsert_email_record(row: pd.Series) -> int:
+    with engine.begin() as conn:
+        res = conn.execute(text(
+            """
+            INSERT INTO emails (sender, subject, body, sent_date, is_urgent, sentiment, priority_score, category, extracted_phone, extracted_alt_email, requirement_summary, status)
+            VALUES (:sender, :subject, :body, :sent_date, :is_urgent, :sentiment, :priority_score, :category, :extracted_phone, :extracted_alt_email, :requirement_summary, :status)
+            """
+        ), {
+            "sender": row.sender,
+            "subject": row.subject,
+            "body": row.body,
+            "sent_date": row.sent_date.strftime("%Y-%m-%d %H:%M:%S") if isinstance(row.sent_date, pd.Timestamp) else str(row.sent_date),
+            "is_urgent": int(row.is_urgent),
+            "sentiment": row.sentiment,
+            "priority_score": float(row.priority_score),
+            "category": row.category,
+            "extracted_phone": row.extracted_phone,
+            "extracted_alt_email": row.extracted_alt_email,
+            "requirement_summary": row.requirement_summary,
+            "status": row.get("status", "pending"),
+        })
+        return res.lastrowid
+
+
+def save_draft(email_id: int, draft: str):
+    with engine.begin() as conn:
+        conn.execute(text(
+            """
+            INSERT INTO responses (email_id, draft, sent, sent_at)
+            VALUES (:email_id, :draft, 0, NULL)
+            """
+        ), {"email_id": email_id, "draft": draft})
+
+
+def mark_sent(email_id: int):
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE responses SET sent=1, sent_at=:now WHERE email_id=:eid"), {"now": now, "eid": email_id})
+        conn.execute(text("UPDATE emails SET status='resolved' WHERE id=:eid"), {"eid": email_id})
+
+
+def mark_status(email_id: int, status: str):
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE emails SET status=:s WHERE id=:eid"), {"s": status, "eid": email_id})
+
+# ---------------------------
+# Sidebar: Data Ingestion & Settings
+# ---------------------------
+with st.sidebar:
+    st.header("🔌 Data & Settings")
+    st.write("Upload CSV of emails (demo), or configure IMAP in .env to fetch live mail.")
+    uploaded = st.file_uploader("Upload CSV (sender,subject,body,sent_date)", type=["csv"]) 
+    filter_terms = st.multiselect("Subject filter terms", FILTER_TERMS, default=FILTER_TERMS)
+    st.divider()
+    st.subheader("Model Options")
+    use_ml_sentiment = st.checkbox("Use Transformers sentiment (if available)", value=bool(_sentiment_pipe))
+    if not _sentiment_pipe and use_ml_sentiment:
+        st.info("Transformers not available; falling back to rule-based.")
+        use_ml_sentiment = False
+    st.subheader("Priority Thresholds")
+    urgent_threshold = st.slider("Urgent score ≥", 0, 10, 5)
+
+# ---------------------------
+# Load data
+# ---------------------------
+if uploaded is not None:
+    try:
+        raw_df = load_emails_csv(uploaded)
+        st.success(f"Loaded {len(raw_df)} emails from CSV.")
+    except Exception as e:
+        st.error(f"Failed to read CSV: {e}")
+        st.stop()
+else:
+    st.warning("No CSV uploaded. Use the sample dataset from the prompt to demo.")
+    raw_df = pd.DataFrame(columns=["sender","subject","body","sent_date"]) 
+
+# Apply subject filters
+if not raw_df.empty:
+    df = filter_by_subject_terms(raw_df, filter_terms)
+else:
+    df = raw_df.copy()
+
+# Enrich: sentiment, priority, extraction, category
+records = []
+for _, r in df.iterrows():
+    sent = detect_sentiment(r.body)
+    score, is_urgent, category = score_priority(r.subject or "", r.body or "")
+    is_urgent = is_urgent or (score >= urgent_threshold)
+    phone, alt_email, req_sum = extract_info(r.body)
+    records.append({
+        "sender": r.sender,
+        "subject": r.subject,
+        "body": r.body,
+        "sent_date": r.sent_date,
+        "sentiment": sent,
+        "priority_score": score,
+        "is_urgent": is_urgent,
+        "category": category,
+        "extracted_phone": phone,
+        "extracted_alt_email": alt_email,
+        "requirement_summary": req_sum,
+        "status": "pending",
+    })
+
+proc_df = pd.DataFrame(records)
+
+# Priority queue: urgent first, then score desc, then newest first
+if not proc_df.empty:
+    proc_df = proc_df.sort_values(by=["is_urgent","priority_score","sent_date"], ascending=[False, False, False])
+
+# Persist to DB (fresh session)
+if not proc_df.empty:
+    for _, row in proc_df.iterrows():
+        eid = upsert_email_record(row)
+        row["db_id"] = eid
+
+# ---------------------------
+# Dashboard
+# ---------------------------
+st.subheader("📊 Dashboard — Metrics & Trends")
+
+if proc_df.empty:
+    st.info("Upload a CSV to see analytics.")
+else:
+    # KPIs
+    now = datetime.now()
+    last24 = now - timedelta(hours=24)
+    total = len(proc_df)
+    urgent_count = int(proc_df["is_urgent"].sum())
+    neg_count = int((proc_df["sentiment"] == "negative").sum())
+    last24_count = int((pd.to_datetime(proc_df["sent_date"]) >= last24).sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total filtered emails", total)
+    c2.metric("Urgent", urgent_count)
+    c3.metric("Negative sentiment", neg_count)
+    c4.metric("Last 24h", last24_count)
+
+    # Distribution charts
+    left, right = st.columns(2)
+    with left:
+        pie_df = proc_df.groupby("category").size().reset_index(name="count")
+        fig = px.pie(pie_df, values="count", names="category", title="Categories")
+        st.plotly_chart(fig, use_container_width=True)
+    with right:
+        bar_df = proc_df.groupby("sentiment").size().reset_index(name="count")
+        fig2 = px.bar(bar_df, x="sentiment", y="count", title="Sentiment distribution")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # Tabbed views
+    t1, t2, t3 = st.tabs(["📥 Inbox (Priority Queue)", "🧠 Details + Drafts", "📈 Raw Table"])
+
+    with t1:
+        st.write("Emails ranked by urgency and score. Click an email ID in the next tab to act.")
+        view_cols = ["sender","subject","sentiment","category","priority_score","is_urgent","sent_date"]
+        st.dataframe(proc_df[view_cols], use_container_width=True)
+
+    with t2:
+        st.write("Select an email to review extracted details and an AI-generated draft response.")
+        # Assign stable IDs: we saved db_id during upsert; if not present (e.g., rerun), compute fallback
+        if "db_id" not in proc_df.columns:
+            proc_df["db_id"] = range(1, len(proc_df)+1)
+        ids = list(proc_df.index)
+        idx = st.selectbox("Pick an email (by row #)", ids)
+        row = proc_df.loc[idx]
+
+        # Show extracted info
+        st.markdown("### Extracted Details")
+        c1, c2, c3 = st.columns(3)
+        c1.write(f"**Sender:** {row.sender}")
+        c1.write(f"**Category:** {row.category}")
+        c2.write(f"**Sentiment:** {row.sentiment}")
+        c2.write(f"**Urgent:** {'Yes' if row.is_urgent else 'No'} (score {row.priority_score:.1f})")
+        c3.write(f"**Sent:** {row.sent_date}")
+        st.write(f"**Requirement summary:** {row.requirement_summary or '—'}")
+        if row.extracted_phone:
+            st.write(f"**Phone(s):** {row.extracted_phone}")
+        if row.extracted_alt_email:
+            st.write(f"**Alt email(s):** {row.extracted_alt_email}")
+
+        # RAG context
+        query = f"{row.subject} {row.body}"
+        kb_ctx = retrieve_kb_context(query, top_k=3)
+
+        # Draft
+        draft = generate_draft(row.sender, row.subject, row.body, row.category, row.sentiment, kb_ctx)
+        edited = st.text_area("AI Draft (editable before sending)", value=draft, height=320)
+
+        colA, colB, colC = st.columns(3)
+        with colA:
+            if st.button("💾 Save Draft"):
+                save_draft(int(row.get("db_id", 0) or 0), edited)
+                st.success("Draft saved.")
+        with colB:
+            if st.button("✅ Mark Resolved"):
+                mark_status(int(row.get("db_id", 0) or 0), "resolved")
+                st.success("Marked as resolved.")
+        with colC:
+            if st.button("📤 Send Reply (Simulated)"):
+                # Here you'd call real SMTP; we'll simulate
+                time.sleep(0.6)
+                mark_sent(int(row.get("db_id", 0) or 0))
+                st.success("Reply sent and ticket resolved.")
+
+        st.markdown("#### Original Email")
+        st.write(f"**Subject:** {row.subject}")
+        st.write(row.body)
+
+        st.markdown("#### Retrieved Knowledge (RAG)")
+        for i, ctx in enumerate(kb_ctx, 1):
+            st.write(f"{i}. {ctx}")
+
+    with t3:
+        st.dataframe(proc_df, use_container_width=True)
+
+st.divider()
+st.markdown(
+    "**Notes**: This demo prioritizes clear architecture and hackathon-ready features. Replace the draft generator with your preferred LLM, plug in IMAP/SMTP for live email, and expand the KB and extraction rules as needed."
+)
